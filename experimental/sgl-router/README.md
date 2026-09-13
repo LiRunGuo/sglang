@@ -68,6 +68,39 @@ The Indexer replaces the Router-local radix tree as the native Cache-Aware
 signal. Query timeouts and local concurrency are bounded by the two Indexer
 options, which default to 100 ms and 32 respectively.
 
+## Chat rendering and compatibility
+
+For text chat, the router renders and tokenizes with Dynamo and forwards the
+result as `input_ids`, retaining the original messages and request options.
+SGLang uses these IDs as the prompt and skips its own rendering and tokenization.
+This applies to all routing policies, including requests with tools, reasoning
+history, and `chat_template_kwargs`.
+
+Compatibility with requests sent directly to SGLang is incomplete. In particular:
+
+- Final assistant turns and `continue_final_message` can differ: the router
+  currently always requests a generation prompt.
+- Per-request `chat_template`, top-level reasoning controls (`reasoning` and
+  `reasoning_effort`), and `task` are not fully connected to the Dynamo renderer.
+- Tools and tool history use Dynamo's formatting; SGLang's tool selection,
+  legacy `functions`, and message normalization may produce a different prompt.
+- Worker template overrides, default template kwargs, reasoning defaults, and
+  tokenizer configuration are not automatically synchronized with the router.
+
+These options do not block ID forwarding. Retaining them in the request does
+not make the engine apply them to the already-rendered prompt; an option may
+therefore be ignored during rendering or differ from direct SGLang behavior.
+Use matching model/tokenizer files on the router and workers. Completing the
+request adapter and testing token parity against SGLang are follow-up work.
+
+Caller-provided `input_ids` are preserved. Messages with non-text content parts
+(images, audio, video, or unknown part types) use engine-side preprocessing;
+injecting IDs would bypass media extraction. Text-only content arrays and
+tool-call messages with null or omitted content remain eligible. If rendering
+or tokenization fails, or no formatter is available, the router forwards the
+original prompt without injecting IDs. Raw-text fallback tokens are used only
+for routing.
+
 ## Upgrading from `cache_aware_zmq`
 
 The `cache_aware_zmq` policy has been removed. Configurations using it should

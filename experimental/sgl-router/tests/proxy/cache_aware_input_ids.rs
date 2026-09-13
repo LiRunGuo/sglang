@@ -132,53 +132,35 @@ async fn caller_input_ids_are_used_for_routing_and_preserved() {
 }
 
 #[tokio::test]
-async fn guarded_requests_render_without_forwarding_ids() {
+async fn text_options_forward_router_tokens_and_preserve_request() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx(mock.url.clone());
-    for options in [
-        json!({"tools": [{"type": "function", "function": {"name": "f"}}]}),
-        json!({"chat_template_kwargs": {"thinking": true}}),
-        json!({"reasoning_effort": "none"}),
-        json!({"chat_template": "custom"}),
-    ] {
-        let mut request = json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-        });
-        request
-            .as_object_mut()
-            .unwrap()
-            .extend(options.as_object().unwrap().clone());
-        let tokens = sgl_router::policies::resolve_request_tokens(
-            &ctx.tokenizers,
-            &ModelId(MODEL.into()),
-            &request,
-        )
-        .expect("request renders for routing");
-        assert!(tokens.chat_rendered);
-        assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
-        assert_eq!(captured(&mock), request);
-    }
-}
-
-#[tokio::test]
-async fn reasoning_history_omits_input_ids_and_preserves_messages() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let messages = json!([
-        {"role": "user", "content": "U1"},
-        {"role": "assistant", "content": "A1", "reasoning_content": "R1"},
-        {"role": "user", "content": "U2"}
-    ]);
-    let status = send(ctx, json!({"model": MODEL, "messages": messages})).await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "the engine must render reasoning history with its own template; got {body}"
+    let request = json!({
+        "model": MODEL,
+        "messages": [
+            {"role": "user", "content": "hi", "name": "alice"},
+            {"role": "assistant", "content": "partial", "reasoning_content": "thinking"}
+        ],
+        "tools": [{"type": "function", "function": {"name": "f"}}],
+        "chat_template_kwargs": {"thinking": true},
+        "reasoning_effort": "none",
+        "chat_template": "custom",
+        "continue_final_message": true,
+    });
+    let tokens = sgl_router::policies::resolve_request_tokens(
+        &ctx.tokenizers,
+        &ModelId(MODEL.into()),
+        &request,
+    )
+    .expect("request renders for routing");
+    assert!(tokens.chat_rendered);
+    assert_eq!(send(ctx, request.clone()).await, StatusCode::OK);
+    let mut body = captured(&mock);
+    assert_eq!(
+        body.as_object_mut().unwrap().remove("input_ids"),
+        Some(json!(tokens.ids))
     );
-    assert_eq!(body["messages"], messages);
+    assert_eq!(body, request);
 }
 
 #[tokio::test]

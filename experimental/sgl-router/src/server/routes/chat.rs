@@ -233,7 +233,7 @@ pub async fn chat_completions(
 
     let request_value: serde_json::Value = serde_json::from_slice(&body)
         .map_err(|_| ApiError::BadRequest("invalid request: body must be a JSON object".into()))?;
-    let eligible_for_input_id_forwarding = input_ids_safe_to_forward(&request_value);
+    let eligible_for_input_id_forwarding = can_forward_chat_input_ids(&request_value);
 
     // Resolve IDs only when a consumer needs them. Formatter availability is
     // handled by the rendering path, independently of this decision.
@@ -738,7 +738,8 @@ pub async fn chat_completions(
         start,
     };
 
-    // Successful rendering alone does not establish engine parity.
+    // Router-rendered tokens are authoritative for text chat. Raw-text fallback
+    // tokens are only suitable for routing and must never replace the prompt.
     let forward_input_ids = request_tokens
         .as_ref()
         .filter(|t| eligible_for_input_id_forwarding && t.chat_rendered)
@@ -1228,64 +1229,29 @@ fn build_outgoing_body(
     Ok(Bytes::from(bytes))
 }
 
-/// Request-level eligibility for forwarding router-generated IDs. Successful
-/// chat rendering is checked separately; tokenizer, template, and model defaults
-/// must match the workers. Tools, media, and engine-specific prompt options
-/// remain excluded until their preprocessing is shared with the router.
-fn input_ids_safe_to_forward(value: &serde_json::Value) -> bool {
+/// Forwarding requires text-only messages and no caller-provided IDs.
+/// This does not establish parity with engine-side rendering; see the README's
+/// compatibility notes. Successful chat rendering is checked separately.
+fn can_forward_chat_input_ids(value: &serde_json::Value) -> bool {
+    if !value["input_ids"].is_null() {
+        return false;
+    }
     let Some(messages) = value.get("messages").and_then(|m| m.as_array()) else {
         return false;
     };
-    let Some(last_message) = messages.last() else {
-        return false;
-    };
 
-    // The engine rewrites a final assistant turn, even without continuation mode.
-    if last_message["role"] == "assistant" || value["continue_final_message"] == true {
-        return false;
-    }
-
-    // Caller IDs stay in the original request; never replace them with generated IDs.
-    // The other fields select prompt behavior the router does not fully reproduce.
-    if [
-        "input_ids",
-        "chat_template",
-        "reasoning",
-        "reasoning_effort",
-        "task",
-    ]
-    .iter()
-    .any(|key| !value[key].is_null())
-    {
-        return false;
-    }
-    // Empty collections have no effect. Nonempty kwargs can select engine-specific
-    // reasoning behavior, while tools require schema and message preprocessing.
-    if value.get("chat_template_kwargs").is_some_and(|kwargs| {
-        !kwargs.is_null() && kwargs.as_object().is_none_or(|kwargs| !kwargs.is_empty())
-    }) || ["tools", "functions"].iter().any(|key| {
-        !value[key].is_null() && value[key].as_array().is_none_or(|tools| !tools.is_empty())
-    }) {
-        return false;
-    }
-
-    messages.iter().all(message_supports_input_id_forwarding)
-}
-
-/// Plain text messages need no content normalization. Allow the optional name
-/// preserved by the engine's system/assistant schema; its user schema drops it.
-/// Other fields can carry tool/reasoning history or be discarded by the engine.
-fn message_supports_input_id_forwarding(message: &serde_json::Value) -> bool {
-    let Some(fields) = message.as_object() else {
-        return false;
-    };
-    let role = message["role"].as_str().unwrap_or_default();
-    matches!(role, "system" | "user" | "assistant")
-        && message["content"].is_string()
-        && fields.keys().all(|key| match key.as_str() {
-            "role" | "content" => true,
-            "name" => role != "user" && message["name"].is_string(),
-            _ => false,
+    // The engine's input_ids path skips media extraction. Leave non-text
+    // content parts to the engine until the router also handles media inputs.
+    !messages.is_empty()
+        && messages.iter().all(|message| {
+            message.is_object()
+                && match &message["content"] {
+                    serde_json::Value::String(_) | serde_json::Value::Null => true,
+                    serde_json::Value::Array(parts) => parts
+                        .iter()
+                        .all(|part| part["type"] == "text" && part["text"].is_string()),
+                    _ => false,
+                }
         })
 }
 
@@ -1557,89 +1523,32 @@ mod tests {
         );
     }
 
-    /// Plain text chat with nothing unreplicated → input_ids may be forwarded.
     #[test]
-    fn input_ids_safe_to_forward_allows_plain_text_chat() {
-        assert!(input_ids_safe_to_forward(&serde_json::json!({
-            "messages": [{"role": "user", "content": "hello"}]
-        })));
-        assert!(input_ids_safe_to_forward(&serde_json::json!({
-            "messages": [
-                {"role": "user", "content": "U1"},
-                {"role": "user", "content": "U2"},
-                {"role": "system", "content": "S", "name": "instruction"},
-                {"role": "assistant", "content": "A", "name": "bot"},
-                {"role": "user", "content": "U3"}
-            ],
-            "chat_template_kwargs": {},
-            "tools": [],
-            "functions": []
-        })));
-    }
-
-    /// Every field the engine honors on the `messages` path but which the
-    /// router's encoder does not replicate must block forwarding — otherwise
-    /// the engine uses the router's ids verbatim and silently runs a different
-    /// prompt than the request asked for.
-    #[test]
-    fn input_ids_safe_to_forward_blocks_unreplicated_signals() {
-        let blockers = [
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"functions":[{"name":"f"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":[{"type":"image_url","image_url":"x"}]}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template":"{{ custom }}"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"chat_template_kwargs":{"enable_thinking":true}}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning_effort":"high"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"reasoning":{"enabled":true}}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"task":"generate"}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"}],"continue_final_message":true}),
-            serde_json::json!({"messages":[{"role":"user","content":"hi"},{"role":"assistant","content":"partial"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":"A1","reasoning_content":"R1"},{"role":"user","content":"U2"}]}),
-            serde_json::json!({"messages":[{"role":"user","content":"U1"},{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"f","arguments":"{}"}}]},{"role":"tool","tool_call_id":"c","content":"ok"},{"role":"user","content":"U2"}]}),
-            serde_json::json!({"messages":[{"role":"system","content":"S","tools":[{"type":"function","function":{"name":"f"}}]},{"role":"user","content":"hi"}]}),
-        ];
-        for b in blockers {
-            assert!(
-                !input_ids_safe_to_forward(&b),
-                "must NOT forward input_ids for: {b}"
-            );
+    fn forwarding_preserves_caller_ids_and_media_preprocessing() {
+        let text = serde_json::json!({
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        });
+        assert!(can_forward_chat_input_ids(&text));
+        let mut caller_ids = text.clone();
+        caller_ids["input_ids"] = serde_json::json!([7, 8]);
+        assert!(!can_forward_chat_input_ids(&caller_ids));
+        for kind in [
+            "image_url",
+            "audio_url",
+            "input_audio",
+            "video_url",
+            "unknown",
+        ] {
+            let mut media = text.clone();
+            media["messages"][0]["content"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::json!({"type": kind}));
+            assert!(!can_forward_chat_input_ids(&media), "{kind}");
         }
-    }
-
-    #[test]
-    fn input_ids_safe_to_forward_blocks_message_normalization() {
-        assert!(!input_ids_safe_to_forward(
+        assert!(!can_forward_chat_input_ids(
             &serde_json::json!({"messages": []})
         ));
-        for message in [
-            serde_json::json!({"role": "User", "content": "hi"}),
-            serde_json::json!({"role": "user", "content": null}),
-            serde_json::json!({"role": "user"}),
-            serde_json::json!({"role": "user", "content": "hi", "name": "alice"}),
-            serde_json::json!({"role": "system", "content": "hi", "name": null}),
-            serde_json::json!({"role": "user", "content": "hi", "unknown": "value"}),
-        ] {
-            assert!(!input_ids_safe_to_forward(
-                &serde_json::json!({"messages": [message]})
-            ));
-        }
-    }
-
-    /// Null / false-valued fields do not block (absent ≡ null ≡ default).
-    #[test]
-    fn input_ids_safe_to_forward_ignores_null_and_false_fields() {
-        assert!(input_ids_safe_to_forward(&serde_json::json!({
-            "messages": [
-                {"role": "system", "content": "S"},
-                {"role": "user", "content": "U1"},
-                {"role": "assistant", "content": "hello"},
-                {"role": "user", "content": "hi"}
-            ],
-            "chat_template": null,
-            "reasoning_effort": null,
-            "chat_template_kwargs": null,
-            "continue_final_message": false
-        })));
     }
 
     /// Load-only + PD: `build_outgoing_body` is handed `None` for the value

@@ -28,7 +28,7 @@ use tower::ServiceExt;
 use crate::common::mock_worker::MockWorker;
 
 // deepseek-v4 id → the tokenizer registry auto-attaches the built-in V4 chat
-// encoder, so the model has an engine-equivalent encode path.
+// encoder, so the model has a chat-rendering path.
 const MODEL: &str = "deepseek-v4-tiny";
 
 fn config() -> Config {
@@ -131,77 +131,10 @@ async fn round_robin_plain_chat_forwards_input_ids() {
     );
 }
 
-/// Even under round-robin, a tool request omits `input_ids` (the safe predicate
-/// is policy-independent too).
-#[tokio::test]
-async fn round_robin_tool_request_omits_input_ids() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-    let status = send(
-        ctx,
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let body = captured(&mock);
-    assert!(
-        body.get("input_ids").is_none(),
-        "tool requests must not forward input_ids under any policy; got {body}"
-    );
-}
-
-/// A successful plain-chat forward on a chat-formatter model must NOT emit
-/// `sgl_router_ingress_tokenize_errors_total` — that counter fires only when the
-/// token resolution was attempted but chat rendering or tokenization failed.
-/// A tool request on the same model
-/// is an expected omission: no consumer needs IDs, so token resolution is
-/// skipped and must not emit the error counter either.
-#[tokio::test]
-async fn successful_forward_does_not_emit_ingress_tokenize_error() {
-    let mock = MockWorker::start(vec![]).await;
-    let ctx = build_ctx(mock.url.clone());
-
-    let status = send(
-        Arc::clone(&ctx),
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hello there friend"}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let status = send(
-        Arc::clone(&ctx),
-        json!({
-            "model": MODEL,
-            "messages": [{"role": "user", "content": "hi"}],
-            "tools": [{"type": "function", "function": {"name": "f"}}],
-        }),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-
-    let m = ctx.metrics.render();
-    assert!(
-        m.contains("# TYPE sgl_router_ingress_tokenize_errors_total counter"),
-        "the error counter family must be exposed; got:\n{m}",
-    );
-    assert!(
-        !m.contains("sgl_router_ingress_tokenize_errors_total{"),
-        "healthy forwards (and expected omissions) must not emit the error counter; got:\n{m}",
-    );
-}
-
 /// A loaded formatter must not trigger resolution when no consumer needs IDs.
 /// The failing template makes accidental rendering visible through the error metric.
 #[tokio::test]
-async fn blocked_forwarding_skips_resolution_with_a_failing_formatter() {
+async fn media_skips_rendering_and_failed_text_render_never_forwards_raw_ids() {
     let dir = tempfile::tempdir().unwrap();
     let tokenizer_path = dir.path().join("tokenizer.json");
     std::fs::copy("tests/fixtures/tiny_tokenizer.json", &tokenizer_path).unwrap();
@@ -217,7 +150,7 @@ async fn blocked_forwarding_skips_resolution_with_a_failing_formatter() {
 
     let request = json!({
         "model": MODEL,
-        "messages": [{"role": "user", "content": "hi"}],
+        "messages": [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}],
         "tools": [{"type": "function", "function": {"name": "f"}}],
     });
     assert_eq!(
@@ -232,7 +165,15 @@ async fn blocked_forwarding_skips_resolution_with_a_failing_formatter() {
 
     // An eligible request does attempt rendering and records the failure.
     let mut plain = request;
-    plain.as_object_mut().unwrap().remove("tools");
+    plain["messages"][0]["content"] = json!("hi");
+    let fallback = sgl_router::policies::resolve_request_tokens(
+        &ctx.tokenizers,
+        &ModelId(MODEL.into()),
+        &plain,
+    )
+    .expect("raw-text tokens are available for routing");
+    assert!(!fallback.chat_rendered);
+    assert!(!fallback.ids.is_empty());
     assert_eq!(send(Arc::clone(&ctx), plain.clone()).await, StatusCode::OK);
     assert_eq!(captured(&mock), plain);
     assert!(ctx
